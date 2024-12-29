@@ -1053,15 +1053,17 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
                     masks=~trajectory.response_padding_masks,
                 )
 
-                # # step 4. optimise using the PPO objective over multiple epochs
+                # step 4. optimise using the PPO objective over multiple epochs
                 t0_ppo = time.perf_counter()
                 ppo_stats: List[PPOStats] = []
                 for _ in range(self._ppo_epochs):
                     batch_idxs = torch.randperm(self.batch_size, device=self._device)
+                    # Separate into a number of smaller PPO batches.
                     for i in range(0, self.batch_size, self._ppo_batch_size):
                         mini_batch_idxs = batch_idxs[i : i + self._ppo_batch_size]
 
                         batch_ppo_stats: List[PPOStats] = []
+                        # As a memory-saving trick, split backwards into a few even smaller batches.
                         for j in range(
                             0, self._ppo_batch_size, self._ppo_backward_batch_size
                         ):
@@ -1079,14 +1081,16 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
                                     trajectory,
                                 )
                             )
-                            batch_ppo_stats.append(
-                                self.ppo_step(
-                                    batch_trajectory,
-                                    advantages[backward_batch_idxs],
-                                    returns[backward_batch_idxs],
-                                    context_length,
-                                )
+
+                            # Actually perform the PPO step
+                            step = self.ppo_step(
+                                batch_trajectory,
+                                advantages[backward_batch_idxs],
+                                returns[backward_batch_idxs],
+                                context_length,
                             )
+
+                            batch_ppo_stats.append(step)
                             del batch_trajectory
 
                         ppo_stats.append(PPOStats(*map(sum, zip(*batch_ppo_stats))))
