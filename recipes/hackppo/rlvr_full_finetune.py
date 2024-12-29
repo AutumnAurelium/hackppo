@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import importlib
 import math
 import sys
 import time
@@ -22,6 +23,7 @@ from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.data import padded_collate
 from torchtune.datasets import ConcatDataset
 from torchtune.modules import local_kv_cache
+from torchtune.modules.tokenizers._utils import BaseTokenizer
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.rlhf import PPOStats, Trajectory
 from torchtune.training import DummyProfiler, PROFILER_KEY, Checkpointer, OptimizerInBackwardWrapper
@@ -34,8 +36,10 @@ log = utils.get_logger("DEBUG")
 # so we set a higher limit here
 torch._dynamo.config.cache_size_limit = 16
 
+from torchtune.rlhf.utils._convert_weights import _REWARD
+_REWARD["lm_head.weight"] = "output.weight"
 
-class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
+class PPORLVRFullFinetuneRecipeSingleDevice(FTRecipeInterface):
     """
     Full finetuning recipe for RLHF with PPO for dense transformer-based LLMs such as LLama2. This recipe is optimized
     for single GPU training. Training on CPU is not supported.
@@ -144,11 +148,13 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
     # Models
     _policy_model: nn.Module  # Policy model being trained
     _value_model: nn.Module  # Value model for estimating returns
-    _reward_model: nn.Module  # Reward model for scoring responses
     _ref_policy_model: nn.Module  # Frozen reference policy model
 
+    # Reward function
+    _reward_fn: Callable[["PPORLVRFullFinetuneRecipeSingleDevice", torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
     # Tokenizer
-    _tokenizer: ModelTokenizer
+    _tokenizer: BaseTokenizer
 
     # Optimizer
     _optimizer: Optional[Optimizer]  # None if using optimizer_in_bwd
@@ -249,21 +255,29 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
             self._policy_checkpointer,
             ref_policy_checkpointer,
             self._value_checkpointer,
-            reward_checkpointer,
         ) = self._setup_checkpointers(
             cfg.checkpointer,
             cfg.ref_policy_checkpointer,
             cfg.value_checkpointer,
-            cfg.reward_checkpointer,
         )
 
         # load policy checkpoints
         policy_model_checkpoint_dict = self._policy_checkpointer.load_checkpoint()
         ref_policy_state_dict = ref_policy_checkpointer.load_checkpoint()
 
-        # load reward and value model checkpoints
+        # load value model checkpoint
         value_model_checkpoint_dict = self._value_checkpointer.load_checkpoint()
-        reward_model_state_dict = reward_checkpointer.load_checkpoint()
+
+        # Set up reward function
+        if isinstance(cfg.reward_fn, str):
+            # If string, try to import the function
+            module_path, func_name = cfg.reward_fn.rsplit('.', 1)
+            module = importlib.import_module(module_path)
+            self._reward_fn = getattr(module, func_name)
+        else:
+            # Otherwise, assume it's a configured callable
+            self._reward_fn = config.instantiate(cfg.reward_fn)
+
 
         # update recipe state
         # ``_setup_model`` handles initialization and loading the state dict. This method
@@ -275,17 +289,15 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
         (
             self._policy_model,
             self._value_model,
-            self._reward_model,
             self._ref_policy_model,
         ) = self._setup_models(
             cfg_model=cfg.policy_model,
-            cfg_reward_value_model=cfg.reward_and_value_model,
+            cfg_value_model=cfg.value_model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
             compile_model=self.compile,
             policy_state_dict=policy_model_checkpoint_dict[training.MODEL_KEY],
             ref_policy_state_dict=ref_policy_state_dict[training.MODEL_KEY],
-            value_model_state_dict=value_model_checkpoint_dict[training.MODEL_KEY],
-            reward_model_state_dict=reward_model_state_dict[training.MODEL_KEY],
+            value_model_state_dict=value_model_checkpoint_dict[training.MODEL_KEY]
         )
 
         # setup tokenizer
@@ -532,16 +544,14 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
         self,
         policy_cfg: DictConfig,
         ref_policy_cfg: DictConfig,
-        value_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        value_cfg: DictConfig
     ) -> Tuple[
-        training.Checkpointer,
         training.Checkpointer,
         training.Checkpointer,
         training.Checkpointer,
     ]:
         """
-        Sets up checkpointers for policy, reference policy, value, and reward models.
+        Sets up checkpointers for policy, reference policy, and value models.
         Only the policy checkpoint handles recipe state for resuming from checkpoints.
         """
 
@@ -572,44 +582,35 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
             should_load_recipe_state=False,
         )
 
-        reward_checkpointer = config.instantiate(
-            reward_cfg,
-            should_load_recipe_state=False,
-        )
-
         return (
             policy_checkpointer,
             ref_policy_checkpointer,
-            value_checkpointer,
-            reward_checkpointer,
+            value_checkpointer
         )
 
     def _setup_models(
         self,
         cfg_model: DictConfig,
-        cfg_reward_value_model: DictConfig,
+        cfg_value_model: DictConfig,
         enable_activation_checkpointing: bool,
         compile_model: bool,
         policy_state_dict: Dict[str, Any],
         ref_policy_state_dict: Dict[str, Any],
-        value_model_state_dict: Dict[str, Any],
-        reward_model_state_dict: Dict[str, Any],
+        value_model_state_dict: Dict[str, Any]
     ) -> Tuple[nn.Module, nn.Module, nn.Module]:
         """
-        Sets up the policy model, reference policy model, reward model, and value model.
+        Sets up the policy model, reference policy model, and value model.
         """
 
         with training.set_default_dtype(self._dtype), self._device:
             policy_model = config.instantiate(cfg_model)
             ref_policy_model = config.instantiate(cfg_model)
-            reward_model = config.instantiate(cfg_reward_value_model)
-            value_model = config.instantiate(cfg_reward_value_model)
+            value_model = config.instantiate(cfg_value_model)
 
         if compile_model:
             training.compile_model(policy_model)
             training.compile_model(ref_policy_model)
             training.compile_model(value_model)
-            training.compile_model(reward_model)
 
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
@@ -627,12 +628,6 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
         # output.weight appears in the state_dict and the model's parameters,
         # and removes output.bias from the state dict if found
         training.update_state_dict_for_classifier(
-            reward_model_state_dict, reward_model.named_parameters()
-        )
-        reward_model.load_state_dict(reward_model_state_dict)
-
-        # same as above
-        training.update_state_dict_for_classifier(
             value_model_state_dict, value_model.named_parameters()
         )
         value_model.load_state_dict(value_model_state_dict)
@@ -641,9 +636,6 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         training.validate_expected_param_dtype(
             value_model.named_parameters(), dtype=self._dtype
-        )
-        training.validate_expected_param_dtype(
-            reward_model.named_parameters(), dtype=self._dtype
         )
         training.validate_expected_param_dtype(
             value_model.named_parameters(), dtype=self._dtype
@@ -669,12 +661,8 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 )
                 module.p = 0
 
-        # disabling grad and dropout in reward and reference policy models
-        reward_model.eval()
+        # disabling grad and dropout in reference policy model
         ref_policy_model.eval()
-
-        for p in reward_model.parameters():
-            p.requires_grad = False
 
         for p in ref_policy_model.parameters():
             p.requires_grad = False
@@ -683,7 +671,7 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
 
-        return policy_model, value_model, reward_model, ref_policy_model
+        return policy_model, value_model, ref_policy_model
 
     def _setup_optimizer(
         self,
@@ -847,7 +835,7 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
 
     def generate_trajectory(self, input_ids: torch.Tensor) -> Trajectory:
         """
-        Generates a trajectory given the current policy and value models, the reference policy model, the reward model,
+        Generates a trajectory given the current policy and value models, the reference policy model, the reward function,
         and batch of inputs. This is done over the following steps:
 
         1: Generate responses, and logits corresponding to the responses using the current policy,
@@ -856,7 +844,7 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
         3. Estimate values from the generated responses using the current value function.
         4. Replace any tokens in the response after the first stop token (usually EOS token) with padding,
             producting truncated responses.
-        5. Run the reward model on the (query, truncated-response) pairs.
+        5. Run the reward function on the (query, truncated-response) pairs.
         6. Mask out all the invalid values in the trajectory due to padding tokens.
 
         Args:
@@ -916,10 +904,10 @@ class PPOFullFinetuneRecipeSingleDevice(FTRecipeInterface):
             responses, self._stop_token_ids, self._tokenizer.pad_id
         )
 
-        # step 5. run the reward model on the (query, truncated-response) pairs
-        scores = self._reward_model(
+        # step 5. run the reward function on the (query, truncated-response) pairs
+        scores = self._reward_fn(
             torch.cat([input_ids, responses], dim=1),
-            input_pos=position_ids,
+            input_pos_ids=position_ids,
             mask=masks,
         )
 
@@ -1296,11 +1284,10 @@ def recipe_main(cfg: DictConfig) -> None:
         - Overwritten by arguments from the command-line
     """
     config.log_config(recipe_name="PPOFullFinetuneRecipeSingleDevice", cfg=cfg)
-    recipe = PPOFullFinetuneRecipeSingleDevice(cfg=cfg)
+    recipe = PPORLVRFullFinetuneRecipeSingleDevice(cfg=cfg)
     recipe.setup(cfg=cfg)
     recipe.train()
     recipe.cleanup()
-
 
 if __name__ == "__main__":
     sys.exit(recipe_main())

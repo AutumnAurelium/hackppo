@@ -187,3 +187,7 @@ cover/
 
 # wandb
 wandb/
+
+# model directory
+ckpts/
+local/

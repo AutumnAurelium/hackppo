@@ -10,29 +10,23 @@ authors = [
 ]
 keywords = ["pytorch", "finetuning", "llm"]
 dependencies = [
-
     # Hugging Face integrations
     "datasets",
     "huggingface_hub[hf_transfer]",
     "safetensors",
-
     # Kaggle Integrations
     "kagglehub",
-
     # Tokenization
     "sentencepiece",
     "tiktoken",
     "blobfile>=2",
-
     # Miscellaneous
     "numpy",
     "tqdm",
     "omegaconf",
     "psutil",
-
     # Multimodal
     "Pillow>=9.4.0",
-
 ]
 dynamic = ["version"]
 

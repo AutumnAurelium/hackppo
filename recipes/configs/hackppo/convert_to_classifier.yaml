@@ -1,0 +1,18 @@
+output_dir: ./ckpts/
+
+model:
+  _component_: torchtune.models.hackppo.llama3_1_classifier_8b
+  n_classes: 1
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ./ckpts/Llama-3.1-8B
+  checkpoint_files:
+    [
+      "model-00001-of-00004.safetensors",
+      "model-00002-of-00004.safetensors",
+      "model-00003-of-00004.safetensors",
+      "model-00004-of-00004.safetensors",
+    ]
+  output_dir: ${output_dir}/classifier
+  model_type: REWARD
